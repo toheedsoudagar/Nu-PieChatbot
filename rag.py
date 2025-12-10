@@ -4,46 +4,51 @@ import re
 from collections import defaultdict
 import numpy as np
 
+# Try to import streamlit for secrets (preferred in your Streamlit app).
+# If streamlit is not available, fall back to environment variables.
+try:
+    import streamlit as st
+    _HAS_STREAMLIT = True
+except Exception:
+    _HAS_STREAMLIT = False
+
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from ingest import run_ingestion_if_needed
 
-# ---------- Default Configuration (can be overridden by Streamlit secrets) ----------
-EMBEDDING_MODEL = "embeddinggemma:latest"
+# ---------- Defaults (can be overridden by Streamlit secrets / env) ----------
+EMBEDDING_MODEL = "nomic-embed-text"
 CHROMA_DB_DIR = "chroma_db"
 SCORE_THRESHOLD = 0.40
 MAX_PER_SOURCE = 6
 CANDIDATE_POOL = 20
 FINAL_K = 6
-LLM_MODEL = "gemma3:1b"
+LLM_MODEL = "gpt-oss:120b-cloud"   # default LLM from screenshot
 LLM_TEMPERATURE = 0.1
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-# --- Streamlit secrets (preferred) with an os.environ fallback ---
-try:
-    import streamlit as st  # type: ignore
-    _secrets = st.secrets
-    OLLAMA_BASE_URL = _secrets.get("OLLAMA_HOST") or _secrets.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL")
-    OLLAMA_API_KEY = _secrets.get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY")
-    EMBEDDING_MODEL = _secrets.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
-    LLM_MODEL = _secrets.get("LLM_MODEL", LLM_MODEL)
-    CHROMA_DB_DIR = _secrets.get("CHROMA_DB_DIR", CHROMA_DB_DIR)
-except Exception:
-    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST")
+# Load secrets (Streamlit preferred)
+if _HAS_STREAMLIT:
+    OLLAMA_BASE_URL = st.secrets.get("OLLAMA_HOST")
+    OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY")
+    EMBEDDING_MODEL = st.secrets.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
+    LLM_MODEL = st.secrets.get("LLM_MODEL", LLM_MODEL)
+    CHROMA_DB_DIR = st.secrets.get("CHROMA_DB_DIR", CHROMA_DB_DIR)
+else:
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
     EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
     LLM_MODEL = os.environ.get("LLM_MODEL", LLM_MODEL)
     CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", CHROMA_DB_DIR)
-# ------------------------------------------------------------------------------
 
-# Build kwargs for Ollama client
 ollama_client_kwargs = {}
 if OLLAMA_BASE_URL:
     ollama_client_kwargs["base_url"] = OLLAMA_BASE_URL
 if OLLAMA_API_KEY:
     ollama_client_kwargs["api_key"] = OLLAMA_API_KEY
+
 
 class RAGPipeline:
     def __init__(self):
@@ -247,8 +252,9 @@ class RAGPipeline:
             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
         ]
 
+        # ChatOllama: use .invoke(messages) which returns an object with .content
         response = self.llm.invoke(messages)
-        raw_answer = response.content
+        raw_answer = getattr(response, "content", str(response))
 
         # dedupe answer lines
         lines = [ln.strip() for ln in raw_answer.splitlines() if ln.strip()]
@@ -268,5 +274,9 @@ class RAGPipeline:
 
 if __name__ == "__main__":
     p = RAGPipeline()
-    a, ds = p.ask("hello")
-    print(a)
+    answer, sources = p.ask("What is the purpose of this document?")
+    print("-- ANSWER --")
+    print(answer)
+    print("\n-- SOURCES --")
+    for s in sources:
+        print(s.metadata.get("source"))
