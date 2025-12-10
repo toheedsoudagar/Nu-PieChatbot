@@ -2,20 +2,37 @@ version: "3.8"
 services:
   rag-app:
     build: .
+    image: nu-piechatbot:latest
     ports:
       - "8501:8501"
+    # Mount the repo so you can edit code on host and have container pick it up (optional)
     volumes:
-      - ./:/app:rw                  # your full repo inside container
-      - ./chroma_db:/app/chroma_db  # persistent DB on host (important)
-      - ./docs:/app/docs:ro         # read-only docs folder
+      - ./:/app:rw
+      - ./chroma_db:/app/chroma_db   # persistent Chroma DB (host -> container)
+      - ./docs:/app/docs:ro          # docs are read-only inside container
     environment:
-      - PYTHONUNBUFFERED=1
+      # point to the mounted chroma folder inside the container
       - CHROMA_DB_DIR=/app/chroma_db
       - EMBEDDING_MODEL=embeddinggemma:latest
       - LLM_MODEL=gpt-oss:120b-cloud
-      # If using Ollama cloud:
+      # Example Ollama settings — configure one of these approaches below:
+      # Use Ollama Cloud:
       # - OLLAMA_HOST=https://api.ollama-cloud.example
       # - OLLAMA_API_KEY=sk_xxx
-      # If using a local Ollama daemon on the host (Linux), you can use host networking:
-      # network_mode: "host"  # (uncomment on Linux if you want container to see host services)
+      # Or if you run Ollama locally on the host, set OLLAMA_HOST to host.docker.internal (mac/windows)
+      # - OLLAMA_HOST=http://host.docker.internal:11434
+      # If using Linux and a host-local Ollama daemon, use host networking (see note).
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Uncomment the next line on Linux if you run Ollama as a host service and want the container
+    # to access it at localhost:11434 without host.docker.internal.
+    # network_mode: "host"
+
+# Optional: define a named volume (not required if you mount host folder)
+volumes:
+  chroma_data:
+    driver: local
