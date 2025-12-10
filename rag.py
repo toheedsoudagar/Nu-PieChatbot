@@ -35,7 +35,7 @@ def _get_secret(name, default=""):
     return os.environ.get(name, default)
 
 # Load configuration (prefer st.secrets)
-OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", "https://ollama.com/api"))
+OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", "https://api.ollama.ai"))
 OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_"))
 EMBEDDING_MODEL = _get_secret("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"))
 LLM_MODEL = _get_secret("LLM_MODEL", os.environ.get("LLM_MODEL", "gpt-oss:120b-cloud"))
@@ -317,4 +317,5 @@ if __name__ == "__main__":
     a, s = rp.ask("hello")
     print("Answer:", a)
     print("Sources returned:", len(s))
+
 
