@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  rag-app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app:rw                  # your full repo inside container
+      - ./chroma_db:/app/chroma_db  # persistent DB on host (important)
+      - ./docs:/app/docs:ro         # read-only docs folder
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CHROMA_DB_DIR=/app/chroma_db
+      - EMBEDDING_MODEL=embeddinggemma:latest
+      - LLM_MODEL=gpt-oss:120b-cloud
+      # If using Ollama cloud:
+      # - OLLAMA_HOST=https://api.ollama-cloud.example
+      # - OLLAMA_API_KEY=sk_xxx
+      # If using a local Ollama daemon on the host (Linux), you can use host networking:
+      # network_mode: "host"  # (uncomment on Linux if you want container to see host services)
+    restart: unless-stopped
