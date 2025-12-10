@@ -1,199 +1,219 @@
 # ingest.py
 """
-Ingest documents from ./docs into a persistent Chroma DB (./chroma_db)
-using Ollama Cloud embeddings.
+Simple ingestion: walk a source_dir, load .txt/.md/.pdf files into Documents,
+compute embeddings using Ollama cloud embedding model, and persist a Chroma DB.
 
 Usage:
-  python ingest.py
-
-Notes:
-- Replace OLLAMA_HOST / OLLAMA_API_KEY placeholders if you want inline creds.
-- Ensure poppler-utils and tesseract are installed for PDF/OCR support.
-- Matching EMBEDDING_MODEL is critical: use same model in rag.py and ingest.py.
+    python ingest.py  # uses default folders below
+or
+    from ingest import run_ingest; run_ingest(source_dir="docs", persist_directory="chroma_db")
 """
 
 import os
-import sys
 import traceback
 from pathlib import Path
-from typing import List
 
-# inline placeholders (replace if you want inline credentials)
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://api.ollama.ai")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_")
+# read secrets from streamlit if available, else env
+try:
+    import streamlit as st
+    _st = True
+except Exception:
+    st = None
+    _st = False
 
-# config
-DOCS_DIR = Path("docs")
-CHROMA_DIR = Path("chroma_db")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1200))
-CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 200))
-FORCE_REINGEST = os.environ.get("FORCE_REINGEST", "0") in ("1", "true", "True")
+def _get_secret(name, default=""):
+    if _st:
+        try:
+            val = st.secrets.get(name)
+            if val:
+                return val
+        except Exception:
+            pass
+    return os.environ.get(name, default)
 
-# Make sure libs are available
+EMBEDDING_MODEL = _get_secret("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"))
+OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", ""))
+OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", ""))
+CHROMA_DB_DIR = _get_secret("CHROMA_DB_DIR", os.environ.get("CHROMA_DB_DIR", "chroma_db"))
+
+# ensure env for clients
+if OLLAMA_HOST:
+    os.environ["OLLAMA_HOST"] = OLLAMA_HOST
+if OLLAMA_API_KEY:
+    os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
+os.environ.setdefault("EMBEDDING_MODEL", EMBEDDING_MODEL)
+
+# dynamic imports (so envs are set first)
 try:
     from langchain_ollama import OllamaEmbeddings
+except Exception:
+    OllamaEmbeddings = None
+
+try:
     from langchain_chroma import Chroma
+except Exception:
+    Chroma = None
+
+# Document class import fallback
+try:
     from langchain_core.documents import Document
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    # unstructured for improved parsing
-    from unstructured.partition.auto import partition
-except Exception as e:
-    print("Missing required packages. Please install requirements.txt and try again.")
-    traceback.print_exc()
-    sys.exit(1)
+except Exception:
+    class Document:
+        def __init__(self, page_content, metadata=None):
+            self.page_content = page_content
+            self.metadata = metadata or {}
 
-
-def set_ollama_env():
-    # ensure env for underlying libs
-    if OLLAMA_HOST:
-        os.environ["OLLAMA_HOST"] = OLLAMA_HOST
-    if OLLAMA_API_KEY:
-        os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
-
-
-def load_file(path: Path) -> str:
-    """Try to extract text from many filetypes using unstructured; fallback to plain read."""
+# PDF reader try
+_pdf_reader_available = False
+try:
+    # prefer pypdf
+    import pypdf
+    _pdf_reader_available = True
+    def _read_pdf(path):
+        text = []
+        reader = pypdf.PdfReader(path)
+        for page in reader.pages:
+            try:
+                text.append(page.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(text)
+except Exception:
     try:
-        elems = partition(str(path))
-        parts = [e.get("text", "") if isinstance(e, dict) else (getattr(e, "text", "") or str(e)) for e in elems]
-        text = "\n\n".join(p for p in parts if p)
-        return text
+        import PyPDF2 as pypdf2
+        _pdf_reader_available = True
+        def _read_pdf(path):
+            text = []
+            with open(path, "rb") as fh:
+                reader = pypdf2.PdfReader(fh)
+                for p in reader.pages:
+                    try:
+                        text.append(p.extract_text() or "")
+                    except Exception:
+                        pass
+            return "\n".join(text)
     except Exception:
-        # fallback for plain text files
+        _pdf_reader_available = False
+        def _read_pdf(path):
+            raise RuntimeError("PDF reader not available; install pypdf or PyPDF2 to ingest PDFs.")
+
+def _load_text_file(path: Path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
         try:
-            return path.read_text(encoding="utf-8", errors="ignore")
+            with open(path, "r", encoding="latin-1") as fh:
+                return fh.read()
         except Exception:
             return ""
 
+def collect_documents(source_dir: str):
+    """
+    Walk source_dir and return list of Document(page_content, metadata).
+    Supports .txt .md .pdf. Skip others.
+    """
+    docs = []
+    p = Path(source_dir)
+    if not p.exists():
+        print("Source dir does not exist:", source_dir)
+        return docs
 
-def gather_documents(docs_dir: Path) -> List[Document]:
-    docs: List[Document] = []
-    for p in sorted(docs_dir.rglob("*")):
-        if p.is_file():
-            txt = load_file(p)
-            if not txt or len(txt.strip()) == 0:
+    for f in sorted(p.rglob("*")):
+        if f.is_dir():
+            continue
+        suffix = f.suffix.lower()
+        try:
+            if suffix in [".txt", ".md"]:
+                text = _load_text_file(f)
+            elif suffix == ".pdf":
+                if _pdf_reader_available:
+                    text = _read_pdf(str(f))
+                else:
+                    print("Skipping PDF (no reader installed):", f)
+                    continue
+            else:
+                # skip other file types
                 continue
-            metadata = {"source": str(p.relative_to(docs_dir.parent))}
-            docs.append(Document(page_content=txt, metadata=metadata))
-            print(f"Loaded: {p} (chars={len(txt)})")
+
+            if not text or len(text.strip()) == 0:
+                continue
+
+            # chunking: simple naive split by paragraphs if very long (optional)
+            # For simplicity, we store each file as one document; for better RAG, chunk into smaller docs.
+            meta = {"source": str(f)}
+            docs.append(Document(page_content=text, metadata=meta))
+            print("Collected:", f)
+        except Exception:
+            print("Error reading file:", f)
+            traceback.print_exc()
     return docs
 
+def run_ingest(source_dir: str = "docs", persist_directory: str = CHROMA_DB_DIR):
+    """
+    Main ingestion flow:
+      - collects documents
+      - creates OllamaEmbeddings client (cloud) and checks connectivity
+      - persists Chroma vectorstore
+    """
+    print("=== run_ingest ===")
+    print("Source dir:", source_dir, "Persist dir:", persist_directory)
+    docs = collect_documents(source_dir)
+    print("Collected docs:", len(docs))
 
-def split_documents(docs: List[Document]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP
-    )
-    out: List[Document] = []
-    for d in docs:
-        chunks = splitter.split_text(d.page_content)
-        for i, c in enumerate(chunks):
-            md = dict(d.metadata)
-            md["chunk"] = i
-            out.append(Document(page_content=c, metadata=md))
-    print(f"Split into {len(out)} chunks")
-    return out
-
-
-def get_model_emb_dim(emb):
-    try:
-        if hasattr(emb, "embed_query"):
-            e = emb.embed_query("test")
-            return len(e) if e else None
-        elif hasattr(emb, "embed"):
-            e = emb.embed(["test"])[0]
-            return len(e) if e else None
-    except Exception:
-        return None
-
-
-def get_stored_dim(db: Chroma):
-    try:
-        res = db.get(include=["embeddings"]) or {}
-        embs = res.get("embeddings", [])
-        return len(embs[0]) if embs else None
-    except Exception:
-        return None
-
-
-def run_ingest():
-    set_ollama_env()
-
-    # create embeddings client (do not pass api_key kwarg to avoid pydantic extra errors)
-    try:
-        emb = OllamaEmbeddings(model=EMBEDDING_MODEL)
-        print("Created OllamaEmbeddings model:", EMBEDDING_MODEL)
-    except Exception:
-        print("Failed to create OllamaEmbeddings:")
-        traceback.print_exc()
-        emb = None
-
-    # If FORCE_REINGEST is set, remove existing chroma DB
-    if FORCE_REINGEST and CHROMA_DIR.exists():
-        print("FORCE_REINGEST enabled — deleting existing chroma_db")
-        import shutil
-        shutil.rmtree(CHROMA_DIR, ignore_errors=True)
-
-    # Initialize Chroma (may create empty DB)
-    try:
-        db = Chroma(persist_directory=str(CHROMA_DIR), embedding_function=emb)
-        print("Opened Chroma at", CHROMA_DIR)
-    except Exception:
-        print("Failed to open Chroma client:")
-        traceback.print_exc()
-        db = None
-
-    # If DB exists, check dims
-    if db and emb:
-        model_dim = get_model_emb_dim(emb)
-        stored_dim = get_stored_dim(db)
-        print("Embedding dims -> model:", model_dim, "stored:", stored_dim)
-        if stored_dim and model_dim and stored_dim != model_dim:
-            print("Dimension mismatch between stored DB and current model.")
-            print("Either re-create DB with this embedding model or use the model that created it.")
-            # Do not automatically delete here unless FORCE_REINGEST True.
-            if not FORCE_REINGEST:
-                print("Aborting ingestion to avoid corrupting DB. Set FORCE_REINGEST=1 to force reingest.")
-                return
-
-    # Gather & split documents
-    docs = gather_documents(DOCS_DIR)
-    if not docs:
-        print("No documents found in", DOCS_DIR)
+    if len(docs) == 0:
+        print("No documents found; nothing to ingest.")
         return
-    docs_split = split_documents(docs)
 
-    # Convert to langchain documents if needed and persist to chroma
+    if OllamaEmbeddings is None:
+        raise RuntimeError("langchain_ollama not installed / importable. Install and retry.")
+
+    # create embedding client
     try:
-        # Use Chroma.from_documents for initial ingestion
-        vect = None
         try:
-            # prefer to use the Chroma vectorstore helper to write docs
-            vect = Chroma.from_documents(docs_split, embedding=emb, persist_directory=str(CHROMA_DIR))
-            vect.persist()
-            print("Persisted documents to Chroma (from_documents).")
-        except Exception:
-            # fallback: use db.add_documents if available
-            if db:
-                # some wrappers provide add_documents
-                try:
-                    db.add_documents(docs_split)
-                    print("Added documents to Chroma (add_documents).")
-                except Exception:
-                    # last resort: iterate and add (rare)
-                    print("Failed to add documents via helper methods — aborting.")
-                    traceback.print_exc()
-                    return
+            emb = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=os.environ.get("OLLAMA_HOST"), api_key=os.environ.get("OLLAMA_API_KEY"))
+        except TypeError:
+            emb = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        # connectivity check
+        _ = emb.embed_query("ping")
+        print("Ollama embeddings reachable.")
     except Exception:
-        print("Error writing documents to Chroma:")
+        print("Ollama embeddings not reachable. Check OLLAMA_HOST and OLLAMA_API_KEY.")
         traceback.print_exc()
-        return
+        raise
 
-    print("Ingestion complete.")
+    # create Chroma vectorstore
+    if Chroma is None:
+        raise RuntimeError("langchain_chroma not installed / importable. Install and retry.")
 
+    try:
+        # many Chroma wrappers provide from_documents staticmethod
+        try:
+            vs = Chroma.from_documents(documents=docs, embedding=emb, persist_directory=persist_directory)
+            print("Chroma.from_documents succeeded.")
+        except Exception:
+            # fallback: construct Chroma client and try add_documents
+            store = Chroma(persist_directory=persist_directory, embedding_function=emb)
+            # if Chroma wrapper provides add_documents:
+            try:
+                store.add_documents(docs)
+                store.persist()
+                vs = store
+                print("Chroma created via add_documents.")
+            except Exception:
+                print("Failed to add documents to Chroma.")
+                raise
+        print("Ingestion complete; persisted to:", persist_directory)
+    except Exception:
+        print("Chroma ingestion failed.")
+        traceback.print_exc()
+        raise
 
 if __name__ == "__main__":
-    run_ingest()
-
-
+    # quick CLI entry
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default="docs", help="Source documents directory")
+    parser.add_argument("--persist", default=CHROMA_DB_DIR, help="Chroma persist directory")
+    args = parser.parse_args()
+    run_ingest(source_dir=args.source, persist_directory=args.persist)
