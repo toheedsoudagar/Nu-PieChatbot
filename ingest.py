@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List
 
 # inline placeholders (replace if you want inline credentials)
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://ollama.com/api")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://api.ollama.ai")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_")
 
 # config
@@ -195,4 +195,5 @@ def run_ingest():
 
 if __name__ == "__main__":
     run_ingest()
+
 
