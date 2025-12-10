@@ -25,7 +25,7 @@ OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "51e3006b663948fda90df90f4885a
 # config
 DOCS_DIR = Path("docs")
 CHROMA_DIR = Path("chroma_db")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "embeddinggemma:latest")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1200))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 200))
 FORCE_REINGEST = os.environ.get("FORCE_REINGEST", "0") in ("1", "true", "True")
@@ -195,3 +195,4 @@ def run_ingest():
 
 if __name__ == "__main__":
     run_ingest()
+
