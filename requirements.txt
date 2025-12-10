@@ -1,0 +1,16 @@
+streamlit
+langchain
+langchain-core
+langchain-community
+langchain-chroma
+langchain-ollama
+chromadb
+unstructured
+unstructured[pdf]
+pytesseract
+pdf2image
+numpy
+pandas
+requests
+Pillow
+python-dotenv
