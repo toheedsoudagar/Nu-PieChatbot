@@ -4,6 +4,14 @@ import os
 from collections import defaultdict
 import textwrap
 
+# Try to import streamlit for secrets (preferred in your Streamlit app).
+# If streamlit is not available, fall back to environment variables.
+try:
+    import streamlit as st
+    _HAS_STREAMLIT = True
+except Exception:
+    _HAS_STREAMLIT = False
+
 # LangChain / Chroma imports
 from langchain_community.document_loaders import (
     PyPDFLoader,
@@ -11,18 +19,17 @@ from langchain_community.document_loaders import (
     CSVLoader,
     UnstructuredExcelLoader
 )
-# Utility for filtering metadata before storing in Chroma
 from langchain_community.vectorstores.utils import filter_complex_metadata
-
 from langchain_unstructured.document_loaders import UnstructuredLoader
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-# Optional OCR imports (used only if fallback is needed)
 from tempfile import TemporaryDirectory
 
+# Optional OCR imports (used only if fallback is needed)
 try:
     from pdf2image import convert_from_path
     import pytesseract
@@ -30,32 +37,28 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-# --------- Default Configuration (can be overridden by Streamlit secrets) ----------
+# ---------- Defaults (can be overridden by Streamlit secrets / env) ----------
 DOCS_DIR = "docs"
 DB_DIR = "chroma_db"
-EMBEDDING_MODEL = "embeddinggemma:latest"
+EMBEDDING_MODEL = "nomic-embed-text"        # default embedding model (from screenshot)
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 400
-# -------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-# --- Streamlit secrets (preferred) with an os.environ fallback ---
-try:
-    import streamlit as st  # type: ignore
-    _secrets = st.secrets
-    OLLAMA_BASE_URL = _secrets.get("OLLAMA_HOST") or _secrets.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL")
-    OLLAMA_API_KEY = _secrets.get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY")
-    EMBEDDING_MODEL = _secrets.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
-    CHROMA_DB_DIR = _secrets.get("CHROMA_DB_DIR", DB_DIR)
-    # Keep DB_DIR variable name for compatibility inside file
-    DB_DIR = CHROMA_DB_DIR or DB_DIR
-except Exception:
-    # If streamlit isn't available, fall back to environment variables
-    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST")
+# Streamlit secrets or env variables for Ollama cloud
+if _HAS_STREAMLIT:
+    # Expect these keys in .streamlit/secrets.toml
+    # OLLAMA_HOST, OLLAMA_API_KEY, EMBEDDING_MODEL (optional), CHROMA_DB_DIR (optional)
+    OLLAMA_BASE_URL = st.secrets.get("OLLAMA_HOST")
+    OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY")
+    EMBEDDING_MODEL = st.secrets.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
+    DB_DIR = st.secrets.get("CHROMA_DB_DIR", DB_DIR)
+else:
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
-    # allow overriding embedding model via env var
     EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
     DB_DIR = os.environ.get("CHROMA_DB_DIR", DB_DIR)
-# ----------------------------------------------------------------------
+
 
 def ocr_pdf_to_documents(pdf_path):
     """
@@ -83,6 +86,7 @@ def ocr_pdf_to_documents(pdf_path):
         print(f"[ingest][ocr] Failed to OCR {pdf_path}: {e}")
     print(f"[ingest][ocr] OCR produced {len(docs)} page documents for {pdf_path}")
     return docs
+
 
 def load_all_documents():
     docs = []
@@ -148,6 +152,7 @@ def load_all_documents():
     print(f"[ingest] Loaded {len(docs)} raw document sections.")
     return docs
 
+
 def split_into_chunks(docs):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -159,6 +164,7 @@ def split_into_chunks(docs):
     # Report summary by source (counts + preview)
     report_chunk_stats(chunks)
     return chunks
+
 
 def report_chunk_stats(chunks, max_preview_chars=300):
     """
@@ -176,6 +182,7 @@ def report_chunk_stats(chunks, max_preview_chars=300):
         preview = textwrap.shorten((text or "").replace("\n", " "), width=max_preview_chars, placeholder="...")
         print(f"    preview (chunk #{idx}): {preview}")
     print("[ingest] End chunk statistics.\n")
+
 
 def build_vectorstore(chunks):
     # Use Ollama embeddings
@@ -199,6 +206,7 @@ def build_vectorstore(chunks):
     print("[ingest] Chroma DB built and persisted.")
     return vectordb
 
+
 def run_ingestion_if_needed():
     # If DB does not exist or empty, run ingestion
     if not os.path.exists(DB_DIR) or len(os.listdir(DB_DIR)) == 0:
@@ -206,7 +214,7 @@ def run_ingestion_if_needed():
         docs = load_all_documents()
         chunks = split_into_chunks(docs)
 
-        # Filter complex metadata and persist
+        # Filter complex metadata before building the vector store
         print("[ingest] Filtering complex metadata for Chroma compatibility...")
         chunks = filter_complex_metadata(chunks)
 
@@ -214,6 +222,7 @@ def run_ingestion_if_needed():
         print("[ingest] Ingestion complete.")
     else:
         print("[ingest] DB already exists → Skipping ingestion.")
+
 
 if __name__ == "__main__":
     run_ingestion_if_needed()
