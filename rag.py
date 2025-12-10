@@ -10,7 +10,7 @@ from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-from ingest import run_ingestion_if_needed
+from ingest import run_ingest as run_ingestion_if_needed
 
 
 # ============================================================
@@ -209,4 +209,5 @@ if __name__ == "__main__":
     p = RAGPipeline()
     ans, src = p.ask("hello")
     print(ans)
+
 
