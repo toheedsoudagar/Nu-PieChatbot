@@ -1,306 +1,272 @@
-# rag.py (fixed) — do NOT pass api_key/base_url into Ollama wrapper constructors
+# rag.py
 import os
 import re
-import traceback
-import sys
 from collections import defaultdict
 import numpy as np
-import hashlib
 
-# streamlit secrets helper
+from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+
+from ingest import run_ingestion_if_needed
+
+# ---------- Default Configuration (can be overridden by Streamlit secrets) ----------
+EMBEDDING_MODEL = "embeddinggemma:latest"
+CHROMA_DB_DIR = "chroma_db"
+SCORE_THRESHOLD = 0.40
+MAX_PER_SOURCE = 6
+CANDIDATE_POOL = 20
+FINAL_K = 6
+LLM_MODEL = "gemma3:1b"
+LLM_TEMPERATURE = 0.1
+# ------------------------------------------------------------------------------
+
+# --- Streamlit secrets (preferred) with an os.environ fallback ---
 try:
-    import streamlit as st
-    _st_available = True
+    import streamlit as st  # type: ignore
+    _secrets = st.secrets
+    OLLAMA_BASE_URL = _secrets.get("OLLAMA_HOST") or _secrets.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL")
+    OLLAMA_API_KEY = _secrets.get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY")
+    EMBEDDING_MODEL = _secrets.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
+    LLM_MODEL = _secrets.get("LLM_MODEL", LLM_MODEL)
+    CHROMA_DB_DIR = _secrets.get("CHROMA_DB_DIR", CHROMA_DB_DIR)
 except Exception:
-    st = None
-    _st_available = False
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST")
+    OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
+    EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", EMBEDDING_MODEL)
+    LLM_MODEL = os.environ.get("LLM_MODEL", LLM_MODEL)
+    CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", CHROMA_DB_DIR)
+# ------------------------------------------------------------------------------
 
-def _get_secret(name, default=""):
-    if _st_available:
-        try:
-            val = st.secrets.get(name)
-            if val:
-                return val
-        except Exception:
-            pass
-    return os.environ.get(name, default)
-
-# config
-OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", ""))
-OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", ""))
-EMBEDDING_MODEL = _get_secret("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"))
-LLM_MODEL = _get_secret("LLM_MODEL", os.environ.get("LLM_MODEL", "gpt-oss:120b-cloud"))
-CHROMA_DB_DIR = _get_secret("CHROMA_DB_DIR", os.environ.get("CHROMA_DB_DIR", "chroma_db"))
-
-SCORE_THRESHOLD = float(_get_secret("SCORE_THRESHOLD", os.environ.get("SCORE_THRESHOLD", "0.40")))
-CANDIDATE_POOL = int(_get_secret("CANDIDATE_POOL", os.environ.get("CANDIDATE_POOL", "20")))
-FINAL_K = int(_get_secret("FINAL_K", os.environ.get("FINAL_K", "6")))
-LLM_TEMPERATURE = float(_get_secret("LLM_TEMPERATURE", os.environ.get("LLM_TEMPERATURE", "0.2")))
-
-# ensure env visible before imports that might read them
-if OLLAMA_HOST:
-    os.environ["OLLAMA_HOST"] = OLLAMA_HOST
+# Build kwargs for Ollama client
+ollama_client_kwargs = {}
+if OLLAMA_BASE_URL:
+    ollama_client_kwargs["base_url"] = OLLAMA_BASE_URL
 if OLLAMA_API_KEY:
-    os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
-os.environ.setdefault("EMBEDDING_MODEL", EMBEDDING_MODEL)
-os.environ.setdefault("LLM_MODEL", LLM_MODEL)
-
-# optional imports
-try:
-    from langchain_chroma import Chroma
-except Exception:
-    Chroma = None
-
-try:
-    from langchain_core.documents import Document
-except Exception:
-    class Document:
-        def __init__(self, page_content, metadata=None):
-            self.page_content = page_content
-            self.metadata = metadata or {}
-
-# deterministic fallback embeddings (dev)
-class DeterministicFallbackEmbeddings:
-    def __init__(self, dim=512):
-        self.dim = dim
-
-    def _text_to_vector(self, text):
-        if text is None:
-            text = ""
-        h = hashlib.sha256(text.encode("utf-8")).digest()
-        repeats = (self.dim * 4 + len(h) - 1) // len(h)
-        blob = (h * repeats)[: self.dim * 4]
-        vals = []
-        for i in range(0, self.dim * 4, 4):
-            chunk = blob[i : i + 4]
-            v = int.from_bytes(chunk, "big", signed=False)
-            vals.append(((v / 2**32) * 2) - 1)
-        return vals
-
-    def embed_query(self, text):
-        return self._text_to_vector(text)
-
-    def embed_documents(self, texts):
-        return [self._text_to_vector(t) for t in texts]
+    ollama_client_kwargs["api_key"] = OLLAMA_API_KEY
 
 class RAGPipeline:
-    def __init__(self, chroma_dir: str = CHROMA_DB_DIR):
-        print("=== RAGPipeline init ===")
-        print("OLLAMA_HOST present?:", bool(OLLAMA_HOST), "value:", OLLAMA_HOST or "(empty)")
-        print("EMBEDDING_MODEL:", EMBEDDING_MODEL)
-        print("LLM_MODEL:", LLM_MODEL)
-        sys.stdout.flush()
+    def __init__(self):
+        # Ensure ingestion
+        run_ingestion_if_needed()
 
-        self.embeddings = None
-        self.llm = None
-        self.db = None
+        # Embeddings (must match ingestion)
+        print(f"[RAG] Initializing Ollama embeddings (model={EMBEDDING_MODEL}) with kwargs={ollama_client_kwargs}")
+        self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, **ollama_client_kwargs)
 
-        # Import langchain_ollama AFTER environment is set
-        try:
-            from langchain_ollama import OllamaEmbeddings, ChatOllama
-            print("Imported langchain_ollama.")
-        except Exception:
-            print("Could not import langchain_ollama; embeddings/LLM will be disabled.")
-            traceback.print_exc()
-            self.embeddings = DeterministicFallbackEmbeddings(dim=512)
-            self.llm = None
-            # still attempt to init Chroma later if available
-            if Chroma is not None:
-                try:
-                    self.db = Chroma(persist_directory=chroma_dir, embedding_function=self.embeddings)
-                except Exception:
-                    self.db = None
-            return
+        # Chroma DB
+        self.db = Chroma(
+            persist_directory=CHROMA_DB_DIR,
+            embedding_function=self.embeddings
+        )
 
-        # IMPORTANT: many versions of langchain_ollama/ollama do NOT accept api_key/base_url kwargs.
-        # Construct without passing api_key/base_url so Pydantic validation won't reject extra fields.
-        try:
-            try:
-                # Preferred: call with just the model name
-                self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-            except Exception:
-                # If that fails for any reason, try the constructor with explicit args (some versions accept it).
-                # We try the safe order: no kwargs first, then explicit (reverse of earlier code).
-                try:
-                    self.embeddings = OllamaEmbeddings(
-                        model=EMBEDDING_MODEL,
-                        base_url=os.environ.get("OLLAMA_HOST"),
-                        api_key=os.environ.get("OLLAMA_API_KEY"),
-                    )
-                except Exception:
-                    raise
+        # LLM (ChatOllama) — pass same kwargs so it uses cloud/remote if configured
+        print(f"[RAG] Initializing ChatOllama model={LLM_MODEL} temperature={LLM_TEMPERATURE} kwargs={ollama_client_kwargs}")
+        self.llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE, **ollama_client_kwargs)
 
-            # Connectivity probe (small embed)
-            try:
-                _ = self.embeddings.embed_query("ping")
-                print("Ollama embeddings ping OK.")
-            except Exception:
-                print("Embedding ping failed after construction — raising to surface the error.")
-                traceback.print_exc()
-                raise RuntimeError("Embedding client not reachable.")
-        except Exception:
-            print("Failed to initialize OllamaEmbeddings. Ensure OLLAMA_HOST=https://api.ollama.ai and OLLAMA_API_KEY are set and valid.")
-            traceback.print_exc()
-            # fallback to deterministic embeddings to keep app alive (optional)
-            self.embeddings = DeterministicFallbackEmbeddings(dim=512)
+        self.chat_history = []
 
-        # Initialize Chroma if present
-        if Chroma is not None:
-            try:
-                self.db = Chroma(persist_directory=chroma_dir, embedding_function=self.embeddings)
-                print("Chroma DB loaded at:", chroma_dir)
-            except Exception:
-                print("Chroma init failed; continuing without DB.")
-                traceback.print_exc()
-                self.db = None
-        else:
-            print("Chroma not available; db=None")
-            self.db = None
-
-        # Initialize ChatOllama LLM (construct without api_key/base_url first)
-        try:
-            try:
-                self.llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
-            except Exception:
-                # try with explicit args only if the simple constructor fails
-                self.llm = ChatOllama(
-                    model=LLM_MODEL,
-                    temperature=LLM_TEMPERATURE,
-                    base_url=os.environ.get("OLLAMA_HOST"),
-                    api_key=os.environ.get("OLLAMA_API_KEY"),
-                )
-            print("ChatOllama initialized.")
-        except Exception:
-            print("Failed to initialize ChatOllama; LLM will be disabled.")
-            traceback.print_exc()
-            self.llm = None
-
+    # ---------------- helpers ----------------
     @staticmethod
-    def _cosine(a, b):
-        a = np.array(a, dtype=float)
-        b = np.array(b, dtype=float)
-        if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+    def _cosine(v1, v2):
+        v1 = np.array(v1, dtype=float)
+        v2 = np.array(v2, dtype=float)
+        n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
+        if n1 == 0 or n2 == 0:
             return 0.0
-        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+        return float(np.dot(v1, v2) / (n1 * n2))
 
     @staticmethod
     def _compact_text(text, max_chars=1500):
         if not text:
             return ""
-        t = re.sub(r"\s+", " ", text).strip()
+        t = re.sub(r'\s+', ' ', text).strip()
         return t[:max_chars]
 
     @staticmethod
     def _dedupe_sentences(text, max_output_chars=1200):
         if not text:
             return ""
-        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+        parts = re.split(r'(?<=[\.\?\!])\s+', text.strip())
         seen = set()
         out = []
         for p in parts:
             s = p.strip()
-            if not s or s.lower() in seen:
+            if not s:
                 continue
-            seen.add(s.lower())
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(s)
             if sum(len(x) for x in out) > max_output_chars:
                 break
         return " ".join(out)
 
-    def retrieve(self, query, k: int = FINAL_K):
-        if self.embeddings is None:
-            raise RuntimeError("Embeddings are not initialized.")
+    # ---------------- retrieval ----------------
+    def retrieve(self, query, k=FINAL_K, debug=True, force_source=None, source_boost=None,
+                 score_threshold=SCORE_THRESHOLD, max_per_source=MAX_PER_SOURCE,
+                 candidate_pool=CANDIDATE_POOL):
 
+        if debug:
+            print(f"[retrieve] Query={query!r} k={k} force_source={force_source} score_threshold={score_threshold}")
+
+        # embed query
+        q_emb = self.embeddings.embed_query(query)
+
+        # try Chroma similarity_search to get candidates
         try:
-            q_emb = self.embeddings.embed_query(query)
+            candidates = self.db.similarity_search(query, k=candidate_pool)
         except Exception:
-            print("embed_query failed; printing traceback and returning empty.")
-            traceback.print_exc()
-            return []
+            # fallback: read raw arrays from DB
+            if debug:
+                print("[retrieve] similarity_search failed; falling back to db.get()")
+            res = self.db.get(include=["documents", "embeddings", "metadatas"])
+            docs_list = res.get("documents", [])
+            embs_list = res.get("embeddings", [])
+            metas_list = res.get("metadatas", [])
+            candidates = []
+            for i in range(len(docs_list)):
+                class _D: pass
+                d = _D()
+                d.page_content = docs_list[i]
+                d.metadata = metas_list[i] if metas_list else {}
+                d._embedding = embs_list[i]
+                candidates.append(d)
 
-        if self.db is None:
-            print("No Chroma DB available; returning empty list.")
-            return []
+        # collect texts, embeddings, metas
+        texts = []
+        embeddings = []
+        metas = []
+        extracted = 0
+        for c in candidates:
+            emb = getattr(c, "_embedding", None)
+            if emb is not None:
+                embeddings.append(emb)
+                texts.append(getattr(c, "page_content", "") or "")
+                metas.append(getattr(c, "metadata", {}) or {})
+                extracted += 1
 
-        try:
-            candidates = self.db.similarity_search(query, k=CANDIDATE_POOL)
-        except Exception:
-            print("Chroma similarity_search failed.")
-            traceback.print_exc()
+        if extracted == 0:
+            res = self.db.get(include=["documents", "embeddings", "metadatas"])
+            texts = res.get("documents", [])
+            embeddings = res.get("embeddings", [])
+            metas = res.get("metadatas", []) or []
+
+        if len(texts) == 0 or len(embeddings) == 0:
+            if debug:
+                print("[retrieve] No docs/embs available")
             return []
 
         scored = []
-        for c in candidates:
-            emb_meta = None
-            try:
-                emb_meta = c.metadata.get("_embedding")
-            except Exception:
-                emb_meta = None
-            if emb_meta:
-                score = self._cosine(q_emb, emb_meta)
-            else:
-                try:
-                    doc_emb = self.embeddings.embed_documents([c.page_content])[0]
-                    score = self._cosine(q_emb, doc_emb)
-                except Exception:
-                    score = 0.0
-            if score >= SCORE_THRESHOLD:
-                scored.append((c, score))
-            if len(scored) >= k:
+        for idx in range(len(texts)):
+            meta = metas[idx] if metas else {}
+            src = meta.get("source", "unknown") if isinstance(meta, dict) else "unknown"
+            if force_source and (force_source.lower() not in src.lower()):
+                continue
+            base_score = self._cosine(q_emb, embeddings[idx])
+            boost = 1.0
+            if source_boost and isinstance(source_boost, dict):
+                for key, factor in source_boost.items():
+                    if key.lower() in src.lower():
+                        try:
+                            boost = float(factor)
+                        except Exception:
+                            boost = 1.0
+                        break
+            final_score = base_score * boost
+            scored.append({"score": final_score, "text": texts[idx], "meta": meta, "src": src, "idx": idx})
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        filtered = [s for s in scored if s["score"] >= score_threshold]
+
+        if debug:
+            print(f"[retrieve] scored: {len(scored)} ; after threshold: {len(filtered)}")
+
+        by_source_count = defaultdict(int)
+        final_items = []
+        for item in filtered:
+            if by_source_count[item["src"]] >= max_per_source:
+                continue
+            by_source_count[item["src"]] += 1
+            final_items.append(item)
+            if len(final_items) >= k:
                 break
 
-        scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
-        return [s[0] for s in scored_sorted]
+        if debug:
+            print("[retrieve] Final items:")
+            for i, it in enumerate(final_items, 1):
+                preview = (it["text"] or "")[:200].replace("\n", " ")
+                print(f" {i:02d}. score={it['score']:.4f} src={it['src']} preview={preview}")
 
+        docs_out = []
+        for it in final_items:
+            docs_out.append(Document(page_content=it["text"], metadata=it["meta"] or {}))
+
+        return docs_out
+
+    # ---------------- format context ----------------
     def format_context(self, docs):
         if not docs:
             return ""
         grouped = defaultdict(list)
         for d in docs:
-            src = d.metadata.get("source", "unknown")
-            grouped[src].append(self._compact_text(d.page_content))
-        out = []
+            src = (d.metadata.get("source") if isinstance(d.metadata, dict) else "") or "unknown"
+            compacted = self._compact_text(d.page_content, max_chars=2000)
+            grouped[src].append(compacted)
+
+        sections = []
         for src, pieces in grouped.items():
             merged = " ".join(pieces)
             deduped = self._dedupe_sentences(merged)
-            out.append(f"[{src}]\n{deduped}\n")
-        return "\n".join(out)
+            sections.append(f"[{src}]\n{deduped}\n")
 
+        return "\n\n".join(sections)
+
+    # ---------------- ask ----------------
     def ask(self, query):
-        docs = self.retrieve(query)
+        docs = self.retrieve(query, k=FINAL_K, debug=True,
+                             force_source=None, source_boost=None,
+                             score_threshold=SCORE_THRESHOLD,
+                             max_per_source=MAX_PER_SOURCE,
+                             candidate_pool=CANDIDATE_POOL)
+
         context = self.format_context(docs)
-        if not context.strip():
-            return "I don't have enough information in the documents to answer that question.", docs
+
+        if len(context.strip()) == 0:
+            answer = "I don't have enough information in the documents to answer that question."
+            return answer, docs
 
         messages = [
-            {"role": "system", "content": "You are a RAG assistant. Use only the provided context and cite sources."},
+            {"role": "system", "content":
+                "You are a RAG assistant. Use ONLY the provided context. "
+                "Format your answer in clean Markdown with headings and bullet points.\n"
+                "If a fact comes from a document, mention its source in brackets.\n"
+                "Do NOT copy verbatim; synthesize and merge information from different pieces of context. "
+                "If the context doesn't contain the answer, say you don't have enough information."},
             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
         ]
 
-        if self.llm is None:
-            return "LLM not initialized; check ChatOllama availability.", docs
+        response = self.llm.invoke(messages)
+        raw_answer = response.content
 
-        try:
-            if hasattr(self.llm, "invoke"):
-                resp = self.llm.invoke(messages)
-                ans = getattr(resp, "content", str(resp))
-            elif hasattr(self.llm, "generate"):
-                gen = self.llm.generate(messages)
-                try:
-                    ans = gen.generations[0][0].text
-                except Exception:
-                    ans = str(gen)
-            else:
-                ans = str(self.llm(messages))
-        except Exception:
-            print("LLM invocation error:")
-            traceback.print_exc()
-            ans = "There was an error generating the answer."
+        # dedupe answer lines
+        lines = [ln.strip() for ln in raw_answer.splitlines() if ln.strip()]
+        out_lines = []
+        seen = set()
+        for ln in lines:
+            key = ln.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out_lines.append(ln)
+        final_answer = "\n".join(out_lines)
 
-        return ans, docs
+        self.chat_history.append({"user": query, "assistant": final_answer})
+        return final_answer, docs
+
 
 if __name__ == "__main__":
     p = RAGPipeline()
-    a, s = p.ask("hello")
-    print("Answer:", a)
-    print("Sources returned:", len(s))
+    a, ds = p.ask("hello")
+    print(a)
