@@ -1,54 +1,94 @@
-# app.py (Minimalist Chat Interface)
+# app.py — clean, sidebar-free chat UI
 import streamlit as st
-# NOTE: The import is set to 'newrag' to match your existing file name 'newrag.py'
-from rag import RAGPipeline 
+from rag import RAGPipeline
+from ingest import run_ingestion_if_needed
+import traceback
 
-st.set_page_config(page_title="Local RAG Chat", layout="centered")
-st.title("Offline RAG")
+st.set_page_config(page_title="RAG Chat", layout="centered")
+st.title("RAG Chat")
+st.caption("Chat with your documents (Ollama Cloud models configured via Streamlit secrets)")
 
-# --- Pipeline Initialization ---
-# Ensure the pipeline initializes (and ingests docs if needed)
+# --- Pipeline Initialization (cached) ---
 @st.cache_resource
 def initialize_pipeline():
     with st.spinner("Initializing retrieval pipeline..."):
         return RAGPipeline()
 
-pipeline = initialize_pipeline()
+try:
+    pipeline = initialize_pipeline()
+except Exception as e:
+    st.error("Failed to initialize RAG pipeline. Check logs.")
+    st.exception(traceback.format_exc())
+    st.stop()
 
-# --- Session State ---
+# --- Session State for chat ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
-    
-# Initial greeting message
+
 if not st.session_state.messages:
-    st.session_state.messages.append({"role": "assistant", "content": "Hello! I'm your offline RAG assistant. Ask me anything about your documents."})
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": "Hello! I'm your RAG assistant. Ask me anything about your documents."
+    })
 
+# Top controls (minimal)
+cols = st.columns([1, 6, 1])
+with cols[0]:
+    pass
+with cols[1]:
+    if st.button("Clear chat"):
+        st.session_state.messages = [{
+            "role": "assistant",
+            "content": "Hello! I'm your RAG assistant. Ask me anything about your documents."
+        }]
+        st.experimental_rerun()
+with cols[2]:
+    pass
 
-# --- Message Rendering ---
+# Render chat messages
 def render_message(role, content):
-    # Use standard Streamlit chat message components
     avatar = "👤" if role == "user" else "✨"
     with st.chat_message(role, avatar=avatar):
-        st.markdown(content) # Use st.markdown for basic text formatting (e.g., paragraphs, bolding)
+        st.markdown(content)
 
 for msg in st.session_state.messages:
     render_message(msg["role"], msg["content"])
 
-# --- Chat Input and Response ---
+# Chat input
 query = st.chat_input("Ask a question...")
 
 if query:
-    # 1. Display user query
+    # Append and render user's message immediately
     st.session_state.messages.append({"role": "user", "content": query})
     render_message("user", query)
 
-    # 2. Get RAG answer
-    with st.spinner("Thinking — retrieving from local docs..."):
-        answer, docs = pipeline.ask(query)
+    # Run retrieval + LLM
+    try:
+        with st.spinner("Thinking — retrieving from docs and querying LLM..."):
+            answer, docs = pipeline.ask(query)
+    except Exception as e:
+        error_msg = "Sorry — an error occurred when answering. Check logs."
+        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+        render_message("assistant", error_msg)
+        st.error(f"Error: {e}")
+        st.exception(traceback.format_exc())
+        docs = []
+    else:
+        # Append assistant response
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        render_message("assistant", answer)
 
-    # 3. Handle personalization (removed name memory, but keeping it simple)
-    final_answer = answer 
+        # Show retrieved source documents in a compact expander list
+        if docs:
+            for i, d in enumerate(docs, start=1):
+                src = d.metadata.get("source", "unknown") if isinstance(d.metadata, dict) else "unknown"
+                preview = (d.page_content or "")[:600]
+                with st.expander(f"Source {i}: {src}", expanded=False):
+                    st.write(preview)
+                    if len(d.page_content or "") > len(preview):
+                        st.text_area(f"Full text — {src}", value=d.page_content or "", height=300, key=f"full_{i}_{hash(src)}")
 
-    # 4. Display assistant response
-    st.session_state.messages.append({"role": "assistant", "content": final_answer})
-    render_message("assistant", final_answer)
+# Keep conversation history hidden but accessible for debugging if needed
+if st.checkbox("Show conversation history (debug)", value=False):
+    for m in st.session_state.messages:
+        st.write(f"{m['role']}: {m['content'][:400]}")
