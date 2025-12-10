@@ -1,63 +1,95 @@
-# rag.py — Ollama Cloud Version (with placeholders)
-
+# rag.py — Ollama Cloud / delayed-import version
+# Saves: move any langchain_ollama imports until after env vars are set
+# Based on original provided in the repo (edited to delay imports).
 import os
 import re
 import traceback
+import importlib
 from collections import defaultdict
 import numpy as np
 
-from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-
-from ingest import run_ingest as run_ingestion_if_needed
-
-
-# ============================================================
-# INLINE OLLAMA CLOUD CREDENTIALS — REPLACE THESE TWO VALUES
-# ============================================================
-
-OLLAMA_HOST = "https://ollama.com/api"    # <-- Replace with your Ollama Cloud base URL
-OLLAMA_API_KEY = "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_"  # <-- Replace with your API key
+# NOTE: do NOT import langchain_ollama at module top-level — delay until after env set.
+# We still import Chroma and Document since they don't depend on Ollama env vars at import-time.
+try:
+    from langchain_chroma import Chroma
+    from langchain_core.documents import Document
+except Exception:
+    # If these are missing, we let the code fail later with a clear message
+    print("Warning: langchain_chroma/langchain_core not importable at module import time.")
 
 # ============================================================
-
+# INLINE OLLAMA CLOUD CREDENTIALS — REPLACE THESE VALUES
+# ============================================================
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://ollama.com/api")    # <-- Replace if needed
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_")  # <-- Set via env preferable
+# ============================================================
 
 # ---------- Configuration ----------
-EMBEDDING_MODEL = "embeddinggemma:latest"
-CHROMA_DB_DIR = "chroma_db"
-SCORE_THRESHOLD = 0.40
-MAX_PER_SOURCE = 6
-CANDIDATE_POOL = 20
-FINAL_K = 6
-LLM_MODEL = "gpt-oss:120b-cloud"
-LLM_TEMPERATURE = 0.2
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "embeddinggemma:latest")
+CHROMA_DB_DIR = os.environ.get("CHROMA_DB_DIR", "chroma_db")
+SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", 0.40))
+MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", 6))
+CANDIDATE_POOL = int(os.environ.get("CANDIDATE_POOL", 20))
+FINAL_K = int(os.environ.get("FINAL_K", 6))
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss:120b-cloud")
+LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", 0.2))
 
 
 class RAGPipeline:
     def __init__(self):
+        # 1) ensure env vars are set BEFORE importing ollama client libs
+        if OLLAMA_HOST:
+            os.environ["OLLAMA_HOST"] = OLLAMA_HOST
+        if OLLAMA_API_KEY:
+            os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
 
-        # make cloud credentials visible to underlying libraries
-        os.environ["OLLAMA_HOST"] = OLLAMA_HOST
-        os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
-
-        # ingestion step
+        # 2) dynamically import ingest module AFTER env is set to avoid import-time embedding client creation
         try:
-            run_ingestion_if_needed()
+            ingest = importlib.import_module("ingest")
         except Exception:
-            print("Ingestion error:")
+            print("Failed to import ingest module. Ensure ingest.py is on PYTHONPATH.")
             traceback.print_exc()
+            ingest = None
+
+        # 3) run ingestion (ingest.run_ingest will call set_ollama_env internally)
+        if ingest:
+            try:
+                # Prefer explicit function call; it's safe — ingest.run_ingest sets env internally too.
+                ingest.run_ingest()
+            except Exception:
+                print("Ingestion error:")
+                traceback.print_exc()
+
+        # 4) Now import the Ollama client wrappers (after env is set)
+        try:
+            from langchain_ollama import OllamaEmbeddings, ChatOllama
+        except Exception:
+            print("Failed to import langchain_ollama. Make sure package is installed.")
+            traceback.print_exc()
+            raise
 
         # --------------------------
         # Embeddings (Cloud)
         # --------------------------
         self.embeddings = None
         try:
-            self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+            # Prefer passing base_url/api_key explicitly if supported by the wrapper
+            # Some wrappers expect env vars only — passing explicit args is safer if allowed.
+            # If the wrapper doesn't accept base_url/api_key kwargs, it will ignore them or raise.
+            try:
+                self.embeddings = OllamaEmbeddings(
+                    model=EMBEDDING_MODEL,
+                    base_url=os.environ.get("OLLAMA_HOST"),
+                    api_key=os.environ.get("OLLAMA_API_KEY")
+                )
+            except TypeError:
+                # Fallback if the wrapper doesn't accept base_url/api_key in constructor
+                self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
             print("OllamaEmbeddings initialized (cloud mode).")
         except Exception:
             print("Failed to initialize embeddings:")
             traceback.print_exc()
+            self.embeddings = None
 
         # --------------------------
         # Chroma DB
@@ -78,16 +110,21 @@ class RAGPipeline:
         # --------------------------
         self.llm = None
         try:
-            self.llm = ChatOllama(
-                model=LLM_MODEL,
-                temperature=LLM_TEMPERATURE,
-                api_key=OLLAMA_API_KEY,
-                base_url=OLLAMA_HOST
-            )
+            try:
+                self.llm = ChatOllama(
+                    model=LLM_MODEL,
+                    temperature=LLM_TEMPERATURE,
+                    api_key=os.environ.get("OLLAMA_API_KEY"),
+                    base_url=os.environ.get("OLLAMA_HOST")
+                )
+            except TypeError:
+                # fallback to constructor without explicit api args if wrapper doesn't accept them
+                self.llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
             print("ChatOllama LLM initialized (cloud).")
         except Exception:
             print("Failed to initialize LLM:")
             traceback.print_exc()
+            self.llm = None
 
     # -------------------- helpers --------------------
     @staticmethod
@@ -195,8 +232,24 @@ class RAGPipeline:
         ]
 
         try:
-            response = self.llm.invoke(messages)
-            answer = response.content
+            # ChatOllama wrapper may expose different call signatures; adapt as needed.
+            # Many wrappers provide an .invoke or .generate or .__call__ API. Here we use `.invoke`
+            # because your original code used self.llm.invoke(messages)
+            response = None
+            if hasattr(self.llm, "invoke"):
+                response = self.llm.invoke(messages)
+                # response.content as used in original code
+                answer = getattr(response, "content", str(response))
+            elif hasattr(self.llm, "generate"):
+                gen = self.llm.generate(messages)
+                # extract text depending on wrapper structure
+                try:
+                    answer = gen.generations[0][0].text
+                except Exception:
+                    answer = str(gen)
+            else:
+                # fallback attempt: call as a function
+                answer = str(self.llm(messages))
         except Exception:
             print("LLM error:")
             traceback.print_exc()
@@ -209,5 +262,3 @@ if __name__ == "__main__":
     p = RAGPipeline()
     ans, src = p.ask("hello")
     print(ans)
-
-
