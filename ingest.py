@@ -1,19 +1,22 @@
 # ingest.py
 """
-Simple ingestion: walk a source_dir, load .txt/.md/.pdf files into Documents,
-compute embeddings using Ollama cloud embedding model, and persist a Chroma DB.
+Ingest documents into a Chroma vectorstore using Ollama Cloud embeddings.
+Reads credentials from streamlit.secrets (preferred) or os.environ.
 
 Usage:
-    python ingest.py  # uses default folders below
-or
-    from ingest import run_ingest; run_ingest(source_dir="docs", persist_directory="chroma_db")
+    python ingest.py --source docs --persist chroma_db
+or:
+    from ingest import run_ingest
+    run_ingest(source_dir="docs", persist_directory="chroma_db")
 """
 
 import os
+import sys
 import traceback
 from pathlib import Path
+import argparse
 
-# read secrets from streamlit if available, else env
+# Prefer streamlit.secrets when available
 try:
     import streamlit as st
     _st = True
@@ -24,37 +27,66 @@ except Exception:
 def _get_secret(name, default=""):
     if _st:
         try:
-            val = st.secrets.get(name)
-            if val:
-                return val
+            v = st.secrets.get(name)
+            if v:
+                return v
         except Exception:
             pass
     return os.environ.get(name, default)
 
-EMBEDDING_MODEL = _get_secret("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"))
+# Config (prefer secrets)
 OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", ""))
 OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", ""))
+EMBEDDING_MODEL = _get_secret("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"))
 CHROMA_DB_DIR = _get_secret("CHROMA_DB_DIR", os.environ.get("CHROMA_DB_DIR", "chroma_db"))
 
-# ensure env for clients
+# make sure env visible before imports that might read them
 if OLLAMA_HOST:
     os.environ["OLLAMA_HOST"] = OLLAMA_HOST
 if OLLAMA_API_KEY:
     os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
 os.environ.setdefault("EMBEDDING_MODEL", EMBEDDING_MODEL)
 
-# dynamic imports (so envs are set first)
+# Optional PDF support
+_pdf_available = False
 try:
-    from langchain_ollama import OllamaEmbeddings
+    import pypdf
+    _pdf_available = True
+    def _read_pdf(path: str) -> str:
+        text_parts = []
+        reader = pypdf.PdfReader(path)
+        for p in reader.pages:
+            try:
+                text_parts.append(p.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(text_parts)
 except Exception:
-    OllamaEmbeddings = None
+    try:
+        import PyPDF2 as pypdf2
+        _pdf_available = True
+        def _read_pdf(path: str) -> str:
+            text_parts = []
+            with open(path, "rb") as fh:
+                reader = pypdf2.PdfReader(fh)
+                for p in reader.pages:
+                    try:
+                        text_parts.append(p.extract_text() or "")
+                    except Exception:
+                        pass
+            return "\n".join(text_parts)
+    except Exception:
+        _pdf_available = False
+        def _read_pdf(path: str) -> str:
+            raise RuntimeError("PDF reader not available. Install pypdf or PyPDF2 to ingest PDFs.")
 
+# Try imports that don't require ollama connectivity
 try:
     from langchain_chroma import Chroma
 except Exception:
     Chroma = None
 
-# Document class import fallback
+# Document class fallback
 try:
     from langchain_core.documents import Document
 except Exception:
@@ -63,60 +95,27 @@ except Exception:
             self.page_content = page_content
             self.metadata = metadata or {}
 
-# PDF reader try
-_pdf_reader_available = False
+# Delay importing Ollama embedding wrapper until env is set
 try:
-    # prefer pypdf
-    import pypdf
-    _pdf_reader_available = True
-    def _read_pdf(path):
-        text = []
-        reader = pypdf.PdfReader(path)
-        for page in reader.pages:
-            try:
-                text.append(page.extract_text() or "")
-            except Exception:
-                pass
-        return "\n".join(text)
+    from langchain_ollama import OllamaEmbeddings
 except Exception:
-    try:
-        import PyPDF2 as pypdf2
-        _pdf_reader_available = True
-        def _read_pdf(path):
-            text = []
-            with open(path, "rb") as fh:
-                reader = pypdf2.PdfReader(fh)
-                for p in reader.pages:
-                    try:
-                        text.append(p.extract_text() or "")
-                    except Exception:
-                        pass
-            return "\n".join(text)
-    except Exception:
-        _pdf_reader_available = False
-        def _read_pdf(path):
-            raise RuntimeError("PDF reader not available; install pypdf or PyPDF2 to ingest PDFs.")
+    OllamaEmbeddings = None
 
-def _load_text_file(path: Path):
+def _load_text_file(path: Path) -> str:
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return fh.read()
+        return path.read_text(encoding="utf-8")
     except Exception:
         try:
-            with open(path, "r", encoding="latin-1") as fh:
-                return fh.read()
+            return path.read_text(encoding="latin-1")
         except Exception:
             return ""
 
 def collect_documents(source_dir: str):
-    """
-    Walk source_dir and return list of Document(page_content, metadata).
-    Supports .txt .md .pdf. Skip others.
-    """
+    """Walk source_dir and collect Documents for supported file types."""
     docs = []
     p = Path(source_dir)
     if not p.exists():
-        print("Source dir does not exist:", source_dir)
+        print("Source directory does not exist:", source_dir)
         return docs
 
     for f in sorted(p.rglob("*")):
@@ -127,20 +126,18 @@ def collect_documents(source_dir: str):
             if suffix in [".txt", ".md"]:
                 text = _load_text_file(f)
             elif suffix == ".pdf":
-                if _pdf_reader_available:
+                if _pdf_available:
                     text = _read_pdf(str(f))
                 else:
-                    print("Skipping PDF (no reader installed):", f)
+                    print("Skipping PDF (no PDF reader installed):", f)
                     continue
             else:
-                # skip other file types
+                # skip unsupported types
                 continue
 
-            if not text or len(text.strip()) == 0:
+            if not text or not text.strip():
                 continue
 
-            # chunking: simple naive split by paragraphs if very long (optional)
-            # For simplicity, we store each file as one document; for better RAG, chunk into smaller docs.
             meta = {"source": str(f)}
             docs.append(Document(page_content=text, metadata=meta))
             print("Collected:", f)
@@ -151,69 +148,98 @@ def collect_documents(source_dir: str):
 
 def run_ingest(source_dir: str = "docs", persist_directory: str = CHROMA_DB_DIR):
     """
-    Main ingestion flow:
-      - collects documents
-      - creates OllamaEmbeddings client (cloud) and checks connectivity
-      - persists Chroma vectorstore
+    Collect documents, create/open Chroma vectorstore and persist embeddings.
     """
     print("=== run_ingest ===")
-    print("Source dir:", source_dir, "Persist dir:", persist_directory)
+    print("Source:", source_dir)
+    print("Persist dir:", persist_directory)
     docs = collect_documents(source_dir)
-    print("Collected docs:", len(docs))
+    print("Documents collected:", len(docs))
 
     if len(docs) == 0:
-        print("No documents found; nothing to ingest.")
+        print("No documents found — skipping ingestion.")
         return
 
     if OllamaEmbeddings is None:
-        raise RuntimeError("langchain_ollama not installed / importable. Install and retry.")
+        raise RuntimeError("langchain_ollama (Ollama wrapper) is not importable. Install it in your environment.")
 
-    # create embedding client
+    # Create embedding client — do NOT pass api_key/base_url as kwargs in many versions
     try:
         try:
-            emb = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=os.environ.get("OLLAMA_HOST"), api_key=os.environ.get("OLLAMA_API_KEY"))
-        except TypeError:
             emb = OllamaEmbeddings(model=EMBEDDING_MODEL)
-        # connectivity check
-        _ = emb.embed_query("ping")
-        print("Ollama embeddings reachable.")
-    except Exception:
-        print("Ollama embeddings not reachable. Check OLLAMA_HOST and OLLAMA_API_KEY.")
+        except Exception:
+            # If the straightforward constructor fails, we optionally try with explicit args
+            # (some versions accept them). We try safe constructor first to avoid Pydantic errors.
+            try:
+                emb = OllamaEmbeddings(model=EMBEDDING_MODEL,
+                                       base_url=os.environ.get("OLLAMA_HOST"),
+                                       api_key=os.environ.get("OLLAMA_API_KEY"))
+            except Exception:
+                raise
+        # connectivity probe
+        try:
+            _ = emb.embed_query("ping")
+            print("Embedding client reachable (ping OK).")
+        except Exception:
+            print("Embedding client construction succeeded but embed_query failed. Trace:")
+            traceback.print_exc()
+            raise RuntimeError("Embed probe failed — check OLLAMA_HOST and OLLAMA_API_KEY.")
+    except Exception as e:
+        print("Failed to initialize Ollama embeddings client.")
         traceback.print_exc()
         raise
 
-    # create Chroma vectorstore
     if Chroma is None:
-        raise RuntimeError("langchain_chroma not installed / importable. Install and retry.")
+        raise RuntimeError("langchain_chroma (Chroma wrapper) is not importable. Install it to persist vector DBs.")
 
+    # Create or populate Chroma vectorstore
     try:
-        # many Chroma wrappers provide from_documents staticmethod
+        # Prefer high-level convenience API if available
         try:
+            print("Attempting Chroma.from_documents(...)")
             vs = Chroma.from_documents(documents=docs, embedding=emb, persist_directory=persist_directory)
             print("Chroma.from_documents succeeded.")
         except Exception:
-            # fallback: construct Chroma client and try add_documents
+            print("Chroma.from_documents not available or failed; falling back to manual creation.")
             store = Chroma(persist_directory=persist_directory, embedding_function=emb)
-            # if Chroma wrapper provides add_documents:
+            # some wrappers provide add_documents
             try:
                 store.add_documents(docs)
                 store.persist()
                 vs = store
-                print("Chroma created via add_documents.")
+                print("Added documents and persisted.")
             except Exception:
-                print("Failed to add documents to Chroma.")
-                raise
-        print("Ingestion complete; persisted to:", persist_directory)
+                # Last-resort: iterate and add vectors manually (if interface differs)
+                print("store.add_documents failed; attempting manual add loop.")
+                try:
+                    for d in docs:
+                        # embed text explicitly and call add
+                        emb_vec = emb.embed_documents([d.page_content])[0]
+                        # different Chroma wrappers expect different add signatures; try a few common ones
+                        try:
+                            store.add_texts([d.page_content], metadatas=[d.metadata], embedding=emb_vec)
+                        except Exception:
+                            try:
+                                store.add_documents([d])
+                            except Exception:
+                                # if all attempts fail, raise
+                                raise
+                    store.persist()
+                    vs = store
+                    print("Manual add loop succeeded.")
+                except Exception:
+                    print("Failed to add documents to Chroma using fallback methods.")
+                    raise
+        print("Ingestion completed; persisted to:", persist_directory)
+        return vs
     except Exception:
         print("Chroma ingestion failed.")
         traceback.print_exc()
         raise
 
 if __name__ == "__main__":
-    # quick CLI entry
-    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default="docs", help="Source documents directory")
-    parser.add_argument("--persist", default=CHROMA_DB_DIR, help="Chroma persist directory")
+    parser.add_argument("--source", default="docs", help="Source directory containing docs")
+    parser.add_argument("--persist", default=CHROMA_DB_DIR, help="Chroma DB persist directory")
     args = parser.parse_args()
     run_ingest(source_dir=args.source, persist_directory=args.persist)
