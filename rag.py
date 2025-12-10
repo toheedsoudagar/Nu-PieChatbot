@@ -17,8 +17,8 @@ from ingest import run_ingestion_if_needed
 # INLINE OLLAMA CLOUD CREDENTIALS — REPLACE THESE TWO VALUES
 # ============================================================
 
-OLLAMA_HOST = "https://api.ollama.ai"     # <-- Replace with your Ollama Cloud base URL
-OLLAMA_API_KEY = "YOUR_OLLAMA_API_KEY_HERE"   # <-- Replace with your API key
+OLLAMA_HOST = "https://ollama.com/api"    # <-- Replace with your Ollama Cloud base URL
+OLLAMA_API_KEY = "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_"  # <-- Replace with your API key
 
 # ============================================================
 
@@ -209,3 +209,4 @@ if __name__ == "__main__":
     p = RAGPipeline()
     ans, src = p.ask("hello")
     print(ans)
+
