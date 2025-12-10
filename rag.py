@@ -1,32 +1,27 @@
 # rag.py
 """
-RAGPipeline for Streamlit + Ollama Cloud (delayed-import + fallback).
-Place this file in your repo. Ensure Streamlit secrets contain:
-OLLAMA_HOST, OLLAMA_API_KEY (do not commit keys to repo).
+RAGPipeline for Ollama Cloud embeddings + Ollama Cloud LLM.
+Reads credentials from streamlit.secrets (preferred) or os.environ.
 """
 
 import os
 import re
 import traceback
-import importlib
+import sys
 from collections import defaultdict
 import numpy as np
-import hashlib
-import sys
 
 # Try to read streamlit secrets if running in Streamlit
 try:
-    import streamlit as st  # optional
+    import streamlit as st
     _st_available = True
 except Exception:
     st = None
     _st_available = False
 
 def _get_secret(name, default=""):
-    """Prefer streamlit secrets when available, else environment variable."""
     if _st_available:
         try:
-            # st.secrets acts like a dict; avoid KeyError
             val = st.secrets.get(name)
             if val:
                 return val
@@ -34,9 +29,9 @@ def _get_secret(name, default=""):
             pass
     return os.environ.get(name, default)
 
-# Load configuration (prefer st.secrets)
-OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", "https://api.ollama.ai"))
-OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", "51e3006b663948fda90df90f4885af72.wjBXcfuUkzz128XvGbrCrQf_"))
+# Configuration (prefer st.secrets)
+OLLAMA_HOST = _get_secret("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", ""))
+OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", ""))
 EMBEDDING_MODEL = _get_secret("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"))
 LLM_MODEL = _get_secret("LLM_MODEL", os.environ.get("LLM_MODEL", "gpt-oss:120b-cloud"))
 CHROMA_DB_DIR = _get_secret("CHROMA_DB_DIR", os.environ.get("CHROMA_DB_DIR", "chroma_db"))
@@ -46,141 +41,111 @@ CANDIDATE_POOL = int(_get_secret("CANDIDATE_POOL", os.environ.get("CANDIDATE_POO
 FINAL_K = int(_get_secret("FINAL_K", os.environ.get("FINAL_K", "6")))
 LLM_TEMPERATURE = float(_get_secret("LLM_TEMPERATURE", os.environ.get("LLM_TEMPERATURE", "0.2")))
 
-# Ensure env visible for libs that read env at import time
+# Set env vars immediately so any later import sees them
 if OLLAMA_HOST:
     os.environ["OLLAMA_HOST"] = OLLAMA_HOST
 if OLLAMA_API_KEY:
     os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
-if EMBEDDING_MODEL:
-    os.environ.setdefault("EMBEDDING_MODEL", EMBEDDING_MODEL)
-if LLM_MODEL:
-    os.environ.setdefault("LLM_MODEL", LLM_MODEL)
+os.environ.setdefault("EMBEDDING_MODEL", EMBEDDING_MODEL)
+os.environ.setdefault("LLM_MODEL", LLM_MODEL)
 
-# Fallback deterministic embeddings (fast, deterministic, dev-friendly)
-class DeterministicFallbackEmbeddings:
-    def __init__(self, dim=512):
-        self.dim = dim
-
-    def _text_to_vector(self, text):
-        if text is None:
-            text = ""
-        h = hashlib.sha256(text.encode("utf-8")).digest()
-        repeats = (self.dim * 4 + len(h) - 1) // len(h)
-        blob = (h * repeats)[: self.dim * 4]
-        vals = []
-        for i in range(0, self.dim * 4, 4):
-            chunk = blob[i : i + 4]
-            v = int.from_bytes(chunk, "big", signed=False)
-            vals.append(((v / 2**32) * 2) - 1)
-        return vals
-
-    def embed_query(self, text):
-        return self._text_to_vector(text)
-
-    def embed_documents(self, texts):
-        return [self._text_to_vector(t) for t in texts]
-
-# Try to import Chroma (optional)
+# Optional: import Chroma alias if available (we'll try to use it later)
 try:
     from langchain_chroma import Chroma
 except Exception:
     Chroma = None
 
+# Document class - prefer langchain core if available
+try:
+    from langchain_core.documents import Document
+except Exception:
+    # Minimal fallback Document-like class for safety
+    class Document:
+        def __init__(self, page_content, metadata=None):
+            self.page_content = page_content
+            self.metadata = metadata or {}
+
+# RAG pipeline
 class RAGPipeline:
-    """
-    RAGPipeline: instantiate in your Streamlit app.
-    Usage:
-        from rag import RAGPipeline
-        rag = RAGPipeline()
-        answer, docs = rag.ask("your question")
-    """
-    def __init__(self):
+    def __init__(self, chroma_dir: str = CHROMA_DB_DIR):
         print("=== RAGPipeline init ===")
-        print("OLLAMA_HOST:", bool(OLLAMA_HOST), " value present:", OLLAMA_HOST or "(empty)")
-        print("OLLAMA_API_KEY present?:", bool(OLLAMA_API_KEY))
+        print("OLLAMA_HOST present?:", bool(OLLAMA_HOST), "value:", OLLAMA_HOST or "(empty)")
         print("EMBEDDING_MODEL:", EMBEDDING_MODEL)
         print("LLM_MODEL:", LLM_MODEL)
         sys.stdout.flush()
 
-        # Embeddings/LLM placeholders
+        # Delay importing Ollama wrappers until env is set
         self.embeddings = None
         self.llm = None
         self.db = None
 
-        # Attempt to import Ollama wrappers now that env is set
+        # Initialize Ollama embeddings (cloud). Fail fast if not available.
         try:
             from langchain_ollama import OllamaEmbeddings, ChatOllama
-            print("Imported langchain_ollama.")
+            print("langchain_ollama imported.")
+            # Try to pass explicit base_url/api_key; wrapper might accept or ignore them.
             try:
-                # Try explicit host/api_key if wrapper accepts them
-                try:
-                    self.embeddings = OllamaEmbeddings(
-                        model=EMBEDDING_MODEL,
-                        base_url=os.environ.get("OLLAMA_HOST"),
-                        api_key=os.environ.get("OLLAMA_API_KEY"),
-                    )
-                except TypeError:
-                    # wrapper may not accept base_url/api_key
-                    self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+                self.embeddings = OllamaEmbeddings(
+                    model=EMBEDDING_MODEL,
+                    base_url=os.environ.get("OLLAMA_HOST"),
+                    api_key=os.environ.get("OLLAMA_API_KEY"),
+                )
+            except TypeError:
+                self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
-                # lightweight connectivity probe
-                try:
-                    _ = self.embeddings.embed_query("ping")
-                    print("Ollama embeddings ping OK — Ollama reachable.")
-                except Exception:
-                    print("Ollama embeddings ping failed; falling back to local deterministic embeddings.")
-                    traceback.print_exc()
-                    self.embeddings = DeterministicFallbackEmbeddings(dim=512)
-            except Exception:
-                print("Error initializing OllamaEmbeddings — using fallback.")
-                traceback.print_exc()
-                self.embeddings = DeterministicFallbackEmbeddings(dim=512)
-
-            # Try to initialize LLM
+            # connectivity probe
             try:
-                try:
-                    self.llm = ChatOllama(
-                        model=LLM_MODEL,
-                        temperature=LLM_TEMPERATURE,
-                        base_url=os.environ.get("OLLAMA_HOST"),
-                        api_key=os.environ.get("OLLAMA_API_KEY"),
-                    )
-                except TypeError:
-                    self.llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
-                print("ChatOllama initialized.")
+                _ = self.embeddings.embed_query("ping")
+                print("Ollama embeddings ping succeeded (cloud reachable).")
             except Exception:
-                print("ChatOllama initialization failed — LLM disabled.")
+                print("Ollama embeddings ping failed; raising to halt (we expect cloud embeddings).")
                 traceback.print_exc()
-                self.llm = None
-
-        except Exception:
-            print("langchain_ollama not importable — using deterministic fallback embeddings.")
+                raise RuntimeError("Ollama embeddings not reachable - check OLLAMA_HOST and API key.")
+        except Exception as exc:
+            print("Failed to import/initialize Ollama embeddings. Ensure OLLAMA_HOST=https://api.ollama.ai and OLLAMA_API_KEY are set.")
             traceback.print_exc()
-            self.embeddings = DeterministicFallbackEmbeddings(dim=512)
-            self.llm = None
+            raise
 
-        # Initialize Chroma DB if available and if embeddings provided
+        # initialize Chroma DB if available
         if Chroma is not None:
             try:
-                # If embeddings object is from Ollama wrapper and Chroma expects a specific interface,
-                # the embedding_function param may be accepted. Otherwise Chroma may call embed internally.
-                self.db = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=self.embeddings)
-                print("Chroma DB loaded at:", CHROMA_DB_DIR)
+                # Many Chroma wrappers accept embedding_function or will call embed internally.
+                # We create the Chroma client and let it use the embeddings wrapper.
+                self.db = Chroma(persist_directory=chroma_dir, embedding_function=self.embeddings)
+                print("Chroma DB initialized at:", chroma_dir)
             except Exception:
-                print("Failed to initialize Chroma DB (it may still work without persistent db).")
+                print("Chroma initialization failed.")
                 traceback.print_exc()
                 self.db = None
         else:
-            print("langchain_chroma not available; vector DB disabled.")
+            print("langchain_chroma not available; retrieval will be disabled (db=None).")
             self.db = None
 
+        # LLM initialization (ChatOllama)
+        try:
+            from langchain_ollama import ChatOllama
+            try:
+                self.llm = ChatOllama(
+                    model=LLM_MODEL,
+                    temperature=LLM_TEMPERATURE,
+                    base_url=os.environ.get("OLLAMA_HOST"),
+                    api_key=os.environ.get("OLLAMA_API_KEY"),
+                )
+            except TypeError:
+                self.llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
+            print("ChatOllama initialized.")
+        except Exception:
+            print("ChatOllama not available or failed to initialize. LLM calls will error.")
+            traceback.print_exc()
+            self.llm = None
+
     @staticmethod
-    def _cosine(v1, v2):
-        v1 = np.array(v1, dtype=float)
-        v2 = np.array(v2, dtype=float)
-        if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
+    def _cosine(a, b):
+        a = np.array(a, dtype=float)
+        b = np.array(b, dtype=float)
+        if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
             return 0.0
-        return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
     @staticmethod
     def _compact_text(text, max_chars=1500):
@@ -206,57 +171,53 @@ class RAGPipeline:
                 break
         return " ".join(out)
 
-    def retrieve(self, query, k=FINAL_K):
-        print(f"[retrieve] query: {query}")
+    def retrieve(self, query, k: int = FINAL_K):
+        if self.embeddings is None:
+            raise RuntimeError("Embeddings are not initialized.")
+
         # embed query
         try:
             q_emb = self.embeddings.embed_query(query)
         except Exception:
-            print("embed_query failed; switching to fallback embedding and retrying.")
+            print("embed_query failed; check Ollama access.")
             traceback.print_exc()
-            if not isinstance(self.embeddings, DeterministicFallbackEmbeddings):
-                self.embeddings = DeterministicFallbackEmbeddings(dim=512)
-            q_emb = self.embeddings.embed_query(query)
-
-        # if no DB present, return empty list
-        if self.db is None:
-            print("No vector DB present (Chroma missing or failed). Returning empty results.")
             return []
 
-        # use Chroma similarity_search if available
+        # rely on Chroma if present
+        if self.db is None:
+            print("No vector DB (Chroma) available; returning empty.")
+            return []
+
         try:
             candidates = self.db.similarity_search(query, k=CANDIDATE_POOL)
         except Exception:
-            print("Chroma similarity_search failed; will attempt to score manually if embeddings present.")
+            print("Chroma similarity_search failed; check Chroma/embedding integration.")
             traceback.print_exc()
-            candidates = []
+            return []
 
-        final = []
+        # score candidates with embeddings (prefer candidate.metadata['_embedding'] if present)
+        scored = []
         for c in candidates:
-            # try to read precomputed embedding from metadata
             emb_meta = None
             try:
                 emb_meta = c.metadata.get("_embedding")
             except Exception:
                 emb_meta = None
-
             if emb_meta:
                 score = self._cosine(q_emb, emb_meta)
             else:
-                # embed the doc content to score
                 try:
                     doc_emb = self.embeddings.embed_documents([c.page_content])[0]
                     score = self._cosine(q_emb, doc_emb)
                 except Exception:
                     score = 0.0
-
             if score >= SCORE_THRESHOLD:
-                final.append((c, score))
-            if len(final) >= k:
+                scored.append((c, score))
+            if len(scored) >= k:
                 break
 
-        final_sorted = sorted(final, key=lambda x: x[1], reverse=True)
-        return [f[0] for f in final_sorted]
+        scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
+        return [s[0] for s in scored_sorted]
 
     def format_context(self, docs):
         if not docs:
@@ -279,43 +240,36 @@ class RAGPipeline:
             return "I don't have enough information in the documents to answer that question.", docs
 
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a RAG assistant. Use ONLY the provided context and cite sources in brackets."
-                ),
-            },
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+            {"role": "system", "content": "You are a RAG assistant. Use only the provided context and cite sources."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
         ]
 
-        # If no LLM available, return a helpful message + docs
         if self.llm is None:
-            return "LLM is not available. Check that langchain_ollama is installed and Ollama is reachable.", docs
+            return "LLM not initialized; check ChatOllama availability.", docs
 
         try:
             if hasattr(self.llm, "invoke"):
-                response = self.llm.invoke(messages)
-                answer = getattr(response, "content", str(response))
+                resp = self.llm.invoke(messages)
+                ans = getattr(resp, "content", str(resp))
             elif hasattr(self.llm, "generate"):
                 gen = self.llm.generate(messages)
                 try:
-                    answer = gen.generations[0][0].text
+                    ans = gen.generations[0][0].text
                 except Exception:
-                    answer = str(gen)
+                    ans = str(gen)
             else:
-                answer = str(self.llm(messages))
+                ans = str(self.llm(messages))
         except Exception:
-            print("LLM invocation error:")
+            print("LLM generation error:")
             traceback.print_exc()
-            answer = "There was an error generating the answer."
+            ans = "There was an error generating the answer."
 
-        return answer, docs
+        return ans, docs
 
-# Quick self-test when run directly (not in import)
+
 if __name__ == "__main__":
-    rp = RAGPipeline()
-    a, s = rp.ask("hello")
+    # quick local smoke test (will raise if Ollama cloud not reachable)
+    p = RAGPipeline()
+    a, s = p.ask("Hello, how are you?")
     print("Answer:", a)
     print("Sources returned:", len(s))
-
-
