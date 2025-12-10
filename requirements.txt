@@ -14,3 +14,4 @@ pandas
 requests
 Pillow
 python-dotenv
+langchain_unstructured
